@@ -1,0 +1,427 @@
+---
+title: "Project 17: Public Transportation Usage Analysis"
+author: "Student Project"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    theme: readable
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+source(file.path("R", "helpers.R"))
+invisible(set_project_root())
+check_required_packages()
+configure_pandoc()
+source(file.path("R", "01_data_cleaning.R"))
+source(file.path("R", "02_eda_visualizations.R"))
+source(file.path("R", "03_statistical_analysis.R"))
+
+cleaned <- read_clean_data()
+station_summary <- readr::read_csv("outputs/tables/station_summary.csv", show_col_types = FALSE)
+daily_summary <- readr::read_csv("outputs/tables/daily_summary.csv", show_col_types = FALSE)
+hourly_summary <- readr::read_csv("outputs/tables/hourly_summary.csv", show_col_types = FALSE)
+monthly_summary <- readr::read_csv("outputs/tables/monthly_summary.csv", show_col_types = FALSE)
+seasonal_summary <- readr::read_csv("outputs/tables/seasonal_summary.csv", show_col_types = FALSE)
+holiday_summary <- readr::read_csv("outputs/tables/holiday_summary.csv", show_col_types = FALSE)
+cleaning_summary <- readr::read_csv("outputs/tables/cleaning_summary.csv", show_col_types = FALSE)
+station_coverage <- readr::read_csv("outputs/tables/station_coverage_summary.csv", show_col_types = FALSE)
+descriptive <- readr::read_csv("outputs/tables/descriptive_statistics.csv", show_col_types = FALSE)
+comparison <- readr::read_csv("outputs/tables/weekday_weekend_test.csv", show_col_types = FALSE)
+coefficients <- readr::read_csv("outputs/tables/regression_coefficients.csv", show_col_types = FALSE)
+model_summary <- readr::read_csv("outputs/tables/regression_model_summary.csv", show_col_types = FALSE)
+assumption_checks <- readr::read_csv("outputs/tables/regression_assumption_checks.csv", show_col_types = FALSE)
+
+peak_hour <- hourly_summary |>
+  dplyr::slice_max(.data$mean_passengers_per_observed_hour, n = 1, with_ties = FALSE)
+highest_station <- station_summary |>
+  dplyr::slice_max(.data$total_passengers, n = 1, with_ties = FALSE)
+lowest_station <- station_summary |>
+  dplyr::slice_min(.data$total_passengers, n = 1, with_ties = FALSE)
+peak_month <- monthly_summary |>
+  dplyr::slice_max(.data$mean_passengers_per_station_hour, n = 1, with_ties = FALSE)
+lowest_month <- monthly_summary |>
+  dplyr::slice_min(.data$mean_passengers_per_station_hour, n = 1, with_ties = FALSE)
+peak_season <- seasonal_summary |>
+  dplyr::slice_max(.data$mean_passengers_per_station_hour, n = 1, with_ties = FALSE)
+lowest_season <- seasonal_summary |>
+  dplyr::slice_min(.data$mean_passengers_per_station_hour, n = 1, with_ties = FALSE)
+holiday_means <- holiday_summary |>
+  dplyr::select(holiday, mean_daily_station_passengers)
+holiday_mean <- stats::setNames(
+  holiday_means$mean_daily_station_passengers,
+  as.character(holiday_means$holiday)
+)
+weekend_coefficient <- coefficients |>
+  dplyr::filter(.data$term == "weekend")
+holiday_coefficient <- coefficients |>
+  dplyr::filter(.data$term == "holiday_indicator")
+```
+
+# Introduction
+
+Public transportation ridership varies by station, time of day, day of week,
+and season. Understanding these patterns helps describe when and where transit
+service is most heavily used. This project examines a real hourly ridership
+extract from the New York City Metropolitan Transportation Authority (MTA).
+The analysis describes patterns in the selected station sample; it does not
+estimate causal effects.
+
+# Objectives
+
+- Clean and validate dated station-level passenger and transfer counts.
+- Describe station, hourly, weekday/weekend, monthly, and holiday patterns.
+- Visualize the relationships and summarize them with transparent statistical
+  tests and a regression model.
+- Save reusable cleaned data, tables, charts, and this report automatically.
+
+# Dataset description and source
+
+The data comes from the MTA's official **Subway Hourly Ridership: 2020-2024**
+dataset, available through the [NYC Open Data dataset page](https://data.ny.gov/Transportation/MTA-Subway-Hourly-Ridership-2020-2024/wujg-7c2s)
+and the [Socrata CSV API](https://data.ny.gov/resource/wujg-7c2s.csv).
+The extract in this project covers January 1 through December 31, 2024, and
+contains timestamps, station-complex IDs and names, boroughs, passenger
+counts, and transfer counts. Fare/payment categories are summed into one
+passenger and transfer total per station-hour.
+
+To keep this beginner project practical to download and run, it follows ten
+station complexes throughout the year: five high- and five low-ridership
+stations in the January 2, 2024 snapshot of the MTA data. These were chosen
+using that date's station totals; the sample is not a random or exhaustive
+sample of all NYC stations. The station selection means demand rankings and
+findings apply to these ten stations only.
+
+The timestamps are published as local NYC wall-clock times without a UTC
+offset. The workflow parses the text without converting the displayed hour,
+so the hour-of-day analysis follows the source's clock values.
+
+```{r data-overview}
+knitr::kable(
+  tibble::tibble(
+    Item = c("Cleaned station-hour records", "Stations", "Date range",
+             "Passenger field", "Operational field"),
+    Value = c(
+      nrow(cleaned),
+      dplyr::n_distinct(cleaned$station_id),
+      paste(min(cleaned$date), "to", max(cleaned$date)),
+      "MTA ridership total by station-hour",
+      "MTA transfer total by station-hour"
+    )
+  ),
+  caption = "Overview of the cleaned analysis dataset"
+)
+```
+
+# Preprocessing
+
+The cleaning script standardizes column names, parses timestamps and counts,
+removes rows with invalid required values, limits records to 2024, and removes
+duplicate station/timestamp records. Missing or negative passenger/transfer
+counts are not imputed: invalid records are excluded so fabricated ridership
+is not introduced. The source API aggregation produces one row per station
+complex and timestamp. Extreme passenger counts are flagged using a
+high-tail IQR rule and retained because large peaks can be valid observations.
+The public extract does not contain every possible station-hour. Missing
+station-hour records are not converted to zero or imputed; consequently,
+partial-day totals are not comparable with complete days. The weekday/weekend
+test, weekday/weekend box plot, and holiday summaries use only station-days
+with all 24 hourly observations. Cleaning and coverage counts are calculated
+by the script:
+
+```{r cleaning-summary}
+knitr::kable(cleaning_summary, caption = "Cleaning and validation summary")
+knitr::kable(
+  station_coverage,
+  digits = 1,
+  caption = "Observed versus expected station-hour coverage"
+)
+```
+
+# Exploratory data analysis
+
+## Station demand
+
+```{r station-chart, fig.width=10, fig.height=7}
+knitr::include_graphics("outputs/plots/01_station_demand.png")
+```
+
+The bars rank the ten sampled station complexes by total observed 2024
+passengers. The highest and lowest names and totals in this selected sample
+are **`r highest_station$station`** (`r scales::comma(round(highest_station$total_passengers))`)
+and **`r lowest_station$station`** (`r scales::comma(round(lowest_station$total_passengers))`),
+respectively. This ranking should not be interpreted as a citywide ranking.
+The station coverage table in Preprocessing shows how many station-hours were
+reported for each station; annual totals at stations with less coverage are
+not directly comparable as if all stations had complete records.
+
+## Daily demand trend
+
+```{r trend-chart, fig.width=10, fig.height=5}
+knitr::include_graphics("outputs/plots/02_daily_demand_trend.png")
+```
+
+The line shows mean passengers per reported station-hour for each date, rather
+than a daily total, so it is less affected by the number of records that day.
+The orange smooth line helps reveal broad changes over time; one-day peaks may
+reflect special events, service conditions, or reporting variation and are not
+explained by this observational analysis.
+
+## Peak passenger hours
+
+```{r hourly-chart, fig.width=10, fig.height=5}
+knitr::include_graphics("outputs/plots/03_hourly_demand.png")
+```
+
+The highest mean in the hourly profile occurs at **`r peak_hour$hour`:00**
+(`r round(peak_hour$mean_passengers_per_observed_hour, 1)` passengers per
+reported station-hour). This compares hours using an average rather than a
+total that could be affected by unequal reporting coverage.
+
+## Weekday and hour pattern
+
+```{r heatmap, fig.width=10, fig.height=5}
+knitr::include_graphics("outputs/plots/04_weekday_hour_heatmap.png")
+```
+
+The heat map compares mean station-hour counts by weekday and clock hour.
+Brighter cells indicate higher average observed counts and help identify
+whether peak hours differ across weekdays.
+
+## Weekday versus weekend demand
+
+```{r weekday-weekend-chart, fig.width=8, fig.height=5}
+knitr::include_graphics("outputs/plots/05_weekday_weekend_boxplot.png")
+```
+
+The box plot displays only station-days with all 24 hourly records. This avoids
+comparing partial days as though they were complete; station sample sizes
+differ substantially because the source has uneven coverage.
+
+## Monthly and seasonal demand
+
+```{r monthly-chart, fig.width=10, fig.height=5}
+knitr::include_graphics("outputs/plots/06_monthly_demand.png")
+```
+
+Mean passengers per reported station-hour vary by month. In this sample the
+highest-average month is
+**`r as.character(peak_month$month_name)`**
+(`r round(peak_month$mean_passengers_per_station_hour, 1)`), and the
+lowest-average month is **`r as.character(lowest_month$month_name)`**
+(`r round(lowest_month$mean_passengers_per_station_hour, 1)`). A single
+year's monthly pattern does not establish a recurring seasonal effect.
+
+```{r monthly-seasonal-tables}
+knitr::kable(
+  monthly_summary,
+  digits = 1,
+  caption = "Monthly ridership totals and average observed station-hour counts"
+)
+knitr::kable(
+  seasonal_summary,
+  digits = 1,
+  caption = "Seasonal ridership totals and average observed station-hour counts"
+)
+```
+
+Grouping calendar months into three-month seasons, the largest total is
+observed in **`r as.character(peak_season$season)`** and the smallest in
+**`r as.character(lowest_season$season)`**. Winter combines January, February,
+and December within the 2024 extract. These averages describe this one year
+and do not establish a recurring annual cycle.
+
+## Holiday-related demand
+
+The holiday indicator uses the 2024 U.S. federal holiday calendar added during
+preprocessing; it is not a holiday field supplied by the MTA. Holiday
+observations are few, so their comparison is descriptive only.
+
+```{r holiday-chart, fig.width=9, fig.height=6}
+knitr::include_graphics("outputs/plots/07_holiday_comparison.png")
+```
+
+The holiday chart compares complete station-days only. The mean daily station
+count is `r scales::comma(round(holiday_mean[["Holiday"]]))` on identified
+federal holidays and `r scales::comma(round(holiday_mean[["Non-holiday"]]))`
+on other dates. Holiday observations are relatively few, so the difference is
+descriptive and should not be generalized to other years.
+
+```{r holiday-table}
+knitr::kable(
+  holiday_summary,
+  digits = 1,
+  caption = "Daily station-count summaries on holiday and non-holiday dates"
+)
+```
+
+## Relationships among recorded variables
+
+The passenger/transfer correlation across station-hour records is
+`r round(descriptive$passenger_transfer_correlation, 3)`. These are related
+operational counts from the same station-hours, and correlation does not show
+that transfers cause ridership or vice versa.
+
+```{r relationship-chart, fig.width=11, fig.height=8}
+knitr::include_graphics("outputs/plots/08_passengers_transfers_relationship.png")
+```
+
+Each panel shows the relationship within one station, reducing the visual
+confounding caused by differences in overall station size. The fitted line
+describes association only.
+
+# Statistical analysis
+
+## Descriptive statistics
+
+```{r descriptive-table}
+knitr::kable(
+  descriptive,
+  digits = 2,
+  caption = "Descriptive statistics for station-hour records"
+)
+```
+
+## Weekday/weekend comparison test
+
+The comparison uses the **paired Wilcoxon signed-rank test** on each station's
+mean daily weekday count and mean daily weekend count, using only complete
+24-hour station-days. Pairing controls for
+the large baseline differences between stations. The analysis includes
+`r comparison$paired_stations` stations that have complete observations for
+both day types; the test assumes those station pairs are independent and the
+distribution of paired differences is reasonably symmetric. A Shapiro-Wilk
+test of paired differences is included as a diagnostic, not as proof of
+normality.
+
+```{r comparison-table}
+knitr::kable(comparison, digits = 4, caption = "Paired weekday/weekend test")
+```
+
+The estimated paired median difference (weekday minus weekend) is
+`r scales::comma(round(comparison$median_paired_difference_weekday_minus_weekend))`
+passengers per station-day. The Wilcoxon p-value is
+`r format.pval(comparison$p_value, digits = 3)`. This test assesses evidence
+of a difference among the selected stations; it does not establish why any
+difference occurs.
+
+## Regression model and assumption checks
+
+An ordinary least-squares model predicts `log(1 + passengers)` from weekend
+status, the holiday indicator, hour, month, and station-complex fixed effects.
+The log transformation reduces right-skew; categorical time and station
+terms adjust for recurring hour/month patterns and baseline station scale.
+This is an explanatory association model, not a causal model. Standard OLS
+errors assume independent observations and an adequately specified conditional
+mean and variance structure; hourly observations can be serially correlated
+and heteroskedastic, so conventional p-values may be too optimistic.
+
+```{r model-assumption-checks}
+knitr::kable(
+  assumption_checks,
+  digits = 4,
+  caption = "Numeric checks of residual normality and spread"
+)
+```
+
+The residual standard deviations across fitted-value quartiles help flag
+uneven spread; the Shapiro-Wilk test checks a reproducible residual sample.
+Neither replaces a visual diagnostic, and hourly dependence remains a
+limitation of the model.
+
+```{r model-summary}
+knitr::kable(
+  model_summary |>
+    dplyr::select(
+      r.squared, adj.r.squared, sigma, statistic, p.value, df, nobs
+    ),
+  digits = 4,
+  caption = "Overall ordinary least-squares model summary"
+)
+```
+
+```{r model-key-coefficients}
+key_terms <- dplyr::bind_rows(weekend_coefficient, holiday_coefficient) |>
+  dplyr::mutate(
+    term = dplyr::recode(
+      .data$term,
+      weekend = "Weekend versus weekday",
+      holiday_indicator = "Federal holiday versus non-holiday"
+    )
+  )
+knitr::kable(
+  key_terms |>
+    dplyr::select(term, estimate, conf.low, conf.high, p.value),
+  digits = 4,
+  caption = "Key adjusted associations on the log(1 + passenger count) scale"
+)
+```
+
+The weekend and holiday coefficients describe adjusted associations on the
+log-transformed outcome scale, holding the model's station, hour, and month
+terms constant. They should not be read as causal effects or as exact
+percentage changes in raw passenger counts.
+
+# Findings
+
+- Within the selected sample, **`r highest_station$station`** has the largest
+  total and **`r lowest_station$station`** the smallest.
+- The sample's busiest clock hour is **`r peak_hour$hour`:00**.
+- The highest and lowest monthly mean passenger rates occur in
+  **`r as.character(peak_month$month_name)`** and
+  **`r as.character(lowest_month$month_name)`**, respectively.
+- The highest seasonal mean rate occurs in **`r as.character(peak_season$season)`**.
+- The paired weekday/weekend comparison gives a median station difference of
+  `r scales::comma(round(comparison$median_paired_difference_weekday_minus_weekend))`
+  weekday passengers per station-day and a p-value of
+  `r format.pval(comparison$p_value, digits = 3)`.
+
+# Recommendations
+
+- Use the hourly and weekday-hour patterns as an initial guide for further
+  service-planning review, then validate them against a full-network extract
+  and actual service schedules.
+- Investigate the highest and lowest observed station patterns alongside
+  local population, service changes, disruptions, and special events before
+  making operational decisions.
+- Repeat the monthly and holiday analysis across multiple years and include
+  service-supply, event, and weather information before interpreting changes.
+
+# Limitations
+
+- The analysis follows ten deliberately selected station complexes, not all
+  stations; the sample is not statistically representative of the network.
+- A single calendar year cannot establish long-term trends or recurring
+  seasonality.
+- Holiday flags come from a manually specified federal holiday calendar.
+  Transit ridership may respond differently to holidays, observed dates, and
+  nearby school or local holidays.
+- Missing or invalid counts are excluded rather than imputed. Extreme but
+  nonnegative counts are retained and flagged.
+- Ridership and transfers are observational counts. Unmeasured service
+  changes, disruptions, and external conditions may influence both.
+- The regression uses conventional OLS standard errors despite the potential
+  for serial dependence and heteroskedasticity in hourly counts.
+
+# Conclusion
+
+This reproducible workflow cleans the public MTA ridership extract, generates
+ten figures and reusable summary/model tables, tests a paired weekday/weekend
+difference, and fits a log-linear OLS model. Its results describe temporal
+and station-level patterns in a small selected sample. A full-network,
+multi-year analysis with stronger time-series and service-context modeling
+would be needed before making network-wide or causal claims.
+
+# References
+
+- New York City Metropolitan Transportation Authority. *Subway Hourly
+  Ridership: 2020-2024*. NYC Open Data.
+  <https://data.ny.gov/Transportation/MTA-Subway-Hourly-Ridership-2020-2024/wujg-7c2s>
+- MTA dataset CSV API. <https://data.ny.gov/resource/wujg-7c2s.csv>
+- R Core Team. *R: A Language and Environment for Statistical Computing*.
+  <https://www.r-project.org/>
+- Wickham et al. *tidyverse* and ggplot2 documentation.
+  <https://www.tidyverse.org/> and <https://ggplot2.tidyverse.org/>

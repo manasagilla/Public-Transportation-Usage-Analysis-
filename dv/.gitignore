@@ -1,0 +1,13 @@
+# R and RStudio workspace files
+.Rhistory
+.RData
+.Rproj.user/
+
+# Generated analysis artifacts (recreated by run_project.R)
+outputs/plots/*.png
+outputs/tables/*.csv
+data/processed/*.csv
+report.html
+
+# Keep the raw, documented public-data extract with the project.
+!data/raw/mta_subway_ridership_2024_selected_stations.csv
